@@ -1,14 +1,15 @@
 #!/usr/bin/env python3 
 """
-LAS to STL and optional STL to LandXML Converter with a dynamic UI
+LAS to STL and optional STL to LandXML/PCD Converter with a dynamic UI
 
 This script:
   - Converts a LAS file to an STL mesh.
   - Optionally converts that STL mesh to a LandXML file containing a TIN surface.
+  - Optionally exports the (decimated) point cloud as a LAS file.
   
 The UI includes:
   - Fields for LAS → STL conversion.
-  - Checkboxes to enable/disable LandXML export and GPU decimation.
+  - Checkboxes to enable/disable LandXML export, LAS export, and GPU decimation.
 
 Dependencies:
   - laspy
@@ -81,8 +82,6 @@ LANDXML_TEMPLATE = """<?xml version="1.0" encoding="UTF-8"?>
 # Determine the directory of this script.
 script_dir = os.path.dirname(os.path.abspath(__file__))
 
-# (The library will be loaded later based on whether GPU decimation is requested.)
-
 ####################################
 # Parallel triangulation utilities using Dask
 ####################################
@@ -133,13 +132,14 @@ def keep_partial_in_interior(verts, faces, bbox):
     return (new_verts, new_faces)
 
 ####################################
-# LAS -> STL converter
+# LAS -> STL (and optionally LAS) converter
 ####################################
 def convert_las_to_stl(input_las, output_stl,
                        adaptive_grid=None, adaptive_minfrac=0.1,
                        adaptive_maxfrac=1.0, curve_exponent=1.0,
                        flat_threshold=0.0, flat_fraction=0.0,
-                       curb_threshold=0.2, use_gpu_decimation=False):
+                       curb_threshold=0.2, use_gpu_decimation=False,
+                       output_xyz=None):  # output_xyz now will be treated as a LAS filename.
     # Read the LAS file in chunks.
     with laspy.open(input_las) as las_file:
         total_points = las_file.header.point_count
@@ -167,7 +167,6 @@ def convert_las_to_stl(input_las, output_stl,
 
         # Select which shared library to load based on use_gpu_decimation.
         if use_gpu_decimation:
-            # Load the CUDA–accelerated decimation library.
             if os.name == "nt":
                 dll_path = os.path.join(script_dir, "decimation_cuda.dll")
             else:
@@ -175,11 +174,9 @@ def convert_las_to_stl(input_las, output_stl,
             try:
                 lib = ctypes.CDLL(dll_path)
             except OSError as e:
-                message = f"Could not load GPU decimation library:\n{dll_path}\nError: {e}"
-                sys.exit(message)
+                sys.exit(f"Could not load GPU decimation library:\n{dll_path}\nError: {e}")
             func = lib.adaptive_decimate_points_cuda
         else:
-            # Load the CPU decimation library.
             if os.name == "nt":
                 dll_path = os.path.join(script_dir, "decimation.dll")
             else:
@@ -187,8 +184,7 @@ def convert_las_to_stl(input_las, output_stl,
             try:
                 lib = ctypes.CDLL(dll_path)
             except OSError as e:
-                message = f"Could not load CPU decimation library:\n{dll_path}\nError: {e}"
-                sys.exit(message)
+                sys.exit(f"Could not load CPU decimation library:\n{dll_path}\nError: {e}")
             func = lib.adaptive_decimate_points
 
         func.argtypes = [
@@ -227,22 +223,37 @@ def convert_las_to_stl(input_las, output_stl,
         kept_count = out_n_points.value
         # Create a NumPy array from the C output.
         decimated_points = np.ctypeslib.as_array(out_points, shape=(kept_count, 3)).copy()
-
         # Free the memory allocated in C.
         if os.name != "nt":
             libc = ctypes.CDLL("libc.so.6")
             libc.free.argtypes = [ctypes.c_void_p]
             libc.free(ctypes.cast(out_points, ctypes.c_void_p))
         else:
-            # On Windows, freeing memory allocated in the DLL using msvcrt.free
-            # can cause crashes because the DLL and the Python executable use different CRT heaps.
-            # If possible, export a free function from the DLL and call that instead.
-            # For now, to avoid the crash, we simply skip freeing.
+            # On Windows, skipping freeing to avoid CRT heap issues.
             pass
-
         after_count = decimated_points.shape[0]
         print(f"Retained {after_count} / {before_count} points after adaptive decimation.")
         all_points = decimated_points
+
+    # Optional: Export the (decimated) point cloud as a LAS file.
+    if output_xyz is not None and output_xyz.strip():
+        # Create a new LAS header and file.
+        # Here we set the scale factors and offsets based on the min values.
+        header = laspy.LasHeader(point_format=3, version="1.2")
+        header.x_offset = np.min(all_points[:, 0])
+        header.y_offset = np.min(all_points[:, 1])
+        header.z_offset = np.min(all_points[:, 2])
+        # Set scale factors (adjust these if needed).
+        header.x_scale = 0.001
+        header.y_scale = 0.001
+        header.z_scale = 0.001
+
+        las = laspy.LasData(header)
+        las.x = all_points[:, 0]
+        las.y = all_points[:, 1]
+        las.z = all_points[:, 2]
+        las.write(output_xyz)
+        print(f"Successfully exported decimated point cloud to LAS: {output_xyz}")
 
     # Determine the bounding box.
     min_x, min_y = np.min(all_points[:, :2], axis=0)
@@ -296,10 +307,10 @@ def convert_las_to_stl(input_las, output_stl,
         return
 
     merged_mesh = trimesh.util.concatenate(sub_meshes)
-    print("Cleaning up duplicates and degenerates...")
-    merged_mesh.merge_vertices()
-    merged_mesh.remove_duplicate_faces()
-    merged_mesh.remove_degenerate_faces()
+    print(" NOT Cleaning up duplicates and degenerates...")
+    #merged_mesh.merge_vertices()
+    #merged_mesh.remove_duplicate_faces()
+    #merged_mesh.remove_degenerate_faces()
     print("Exporting final mesh to STL...")
     merged_mesh.export(output_stl, file_type='stl')
     print(f"Successfully exported {output_stl}")
@@ -412,6 +423,9 @@ def run_conversion():
         return
 
     use_gpu = use_gpu_decimation_var.get()
+    # Get optional LAS export filename (if specified)
+    export_xyz_path = entry_xyz_output.get() if export_xyz_var.get() else None
+
     try:
         convert_las_to_stl(
             input_las, output_stl,
@@ -422,7 +436,8 @@ def run_conversion():
             flat_threshold=flat_threshold,
             flat_fraction=flat_fraction,
             curb_threshold=curb_threshold,
-            use_gpu_decimation=use_gpu
+            use_gpu_decimation=use_gpu,
+            output_xyz=export_xyz_path
         )
     except Exception as e:
         messagebox.showerror("Error", f"LAS -> STL failed: {e}")
@@ -447,7 +462,7 @@ def run_conversion():
         try:
             convert_stl_to_landxml(
                 input_stl=output_stl,
-                output_xml=output_landxml,
+                output_xml=entry_landxml_output.get(),
                 project_name=project_name,
                 project_desc=project_desc,
                 app_name=app_name,
@@ -460,7 +475,7 @@ def run_conversion():
                 units_area=units_area,
                 units_volume=units_volume
             )
-            messagebox.showinfo("Success", f"Exported STL + LandXML:\n{output_stl}\n{output_landxml}")
+            messagebox.showinfo("Success", f"Exported STL + LandXML:\n{output_stl}\n{entry_landxml_output.get()}")
         except Exception as e:
             messagebox.showerror("Error", f"STL -> LandXML failed: {e}")
     else:
@@ -471,6 +486,12 @@ def toggle_landxml_frame():
         landxml_frame.grid(row=landxml_row, column=0, columnspan=3, sticky="nsew", pady=(10, 0))
     else:
         landxml_frame.grid_remove()
+
+def toggle_xyz_frame():
+    if export_xyz_var.get():
+        xyz_frame.grid(row=xyz_row, column=0, columnspan=3, sticky="nsew", pady=(10, 0))
+    else:
+        xyz_frame.grid_remove()
 
 def browse_input_file():
     filename = filedialog.askopenfilename(filetypes=[("LAS Files", "*.las")])
@@ -490,6 +511,13 @@ def browse_landxml_file():
         entry_landxml_output.delete(0, tk.END)
         entry_landxml_output.insert(0, filename)
 
+def browse_xyz_file():
+    # Updated to default to .las instead of .pcd.
+    filename = filedialog.asksaveasfilename(defaultextension=".las", filetypes=[("LAS Files", "*.las")])
+    if filename:
+        entry_xyz_output.delete(0, tk.END)
+        entry_xyz_output.insert(0, filename)
+
 ####################################
 # Start of main UI
 ####################################
@@ -502,10 +530,10 @@ def main():
     global entry_lxml_app_name, entry_lxml_manufacturer, entry_lxml_app_version
     global var_cs_name, var_cs_datum, var_cs_zone
     global var_units_linear, var_units_area, var_units_volume
-    global use_gpu_decimation_var
+    global use_gpu_decimation_var, export_xyz_var, xyz_frame, entry_xyz_output, xyz_row
 
     root = tk.Tk()
-    root.title("LAS -> STL -> (optional) LandXML Converter")
+    root.title("LAS -> STL -> (optional) LandXML / LAS Converter")
     main_frame = tk.Frame(root, padx=10, pady=10)
     main_frame.pack(fill=tk.BOTH, expand=True)
     row_idx = 0
@@ -563,6 +591,21 @@ def main():
         row=row_idx, column=0, columnspan=3, sticky=tk.W, pady=(10, 0)
     )
     row_idx += 1
+
+    # Checkbox for Export LAS and its file selection.
+    export_xyz_var = tk.BooleanVar(value=False)
+    tk.Checkbutton(main_frame, text="Export LAS Point Cloud?", variable=export_xyz_var, command=toggle_xyz_frame).grid(
+        row=row_idx, column=0, columnspan=3, sticky=tk.W, pady=(10, 0)
+    )
+    row_idx += 1
+    xyz_row = row_idx
+    xyz_frame = tk.Frame(main_frame, borderwidth=1, relief=tk.RIDGE, padx=5, pady=5)
+    tk.Label(xyz_frame, text="Output LAS File:").grid(row=0, column=0, sticky=tk.W)
+    entry_xyz_output = tk.Entry(xyz_frame, width=50)
+    entry_xyz_output.grid(row=0, column=1)
+    tk.Button(xyz_frame, text="Browse", command=browse_xyz_file).grid(row=0, column=2)
+    xyz_frame.grid(row=xyz_row, column=0, columnspan=3, sticky="nsew", pady=(10, 0))
+    xyz_frame.grid_remove()  # hide by default
 
     export_landxml_var = tk.BooleanVar(value=False)
     tk.Checkbutton(main_frame, text="Export LandXML?", variable=export_landxml_var, command=toggle_landxml_frame).grid(

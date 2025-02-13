@@ -33,6 +33,7 @@
 #define MIN_POINTS_FOR_CURB 12
 #define MIN_UPPER_POINTS 8
 #define CURB_PERCENT 1
+#define surrounding_percent 1
 
 // =======================================================================
 // A simple kernel to reorder points from an interleaved array using an index array.
@@ -307,7 +308,60 @@ void scatter_sampling_kernel(const int* d_unique_cell_ids, const double* d_sampl
 }
 
 // =======================================================================
+// NEW KERNEL: Scatter curb flags for unique cells into a full-grid array.
+// For cells that did not appear (empty cells) the flag remains 0.
+__global__
+void scatter_curb_kernel(const int* d_unique_cell_ids, const int* d_curb, int unique_count, int num_cells, int* d_full_curb) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if(i < unique_count) {
+        int cid = d_unique_cell_ids[i];
+        if(cid < num_cells) {
+            d_full_curb[cid] = d_curb[i];
+        }
+    }
+}
+
+// =======================================================================
+// NEW KERNEL: For each cell in the grid, check if it is a curb cell or if any neighbor
+// (8-connected) is a curb cell. If the cell itself is a curb cell, its sampling fraction is set
+// to CURB_PERCENT. Otherwise, if it is adjacent to a curb cell, its sampling fraction is set
+// to the provided surroundingRetentionFraction.
+__global__
+void preserve_adjacent_kernel(int grid_cells, int num_cells, const int* d_full_curb, double* d_full_sampling, double surroundingRetentionFraction) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if(i < num_cells) {
+        int row = i / grid_cells;
+        int col = i % grid_cells;
+        // If the cell itself is a curb cell, ensure full retention.
+        if(d_full_curb[i] == 1) {
+            d_full_sampling[i] = CURB_PERCENT;
+        } else {
+            bool adjacentCurb = false;
+            // Check only neighbors (excluding self) in the 8-connected neighborhood.
+            for (int dr = -1; dr <= 1 && !adjacentCurb; dr++) {
+                for (int dc = -1; dc <= 1 && !adjacentCurb; dc++) {
+                    if(dr == 0 && dc == 0) continue;  // skip self
+                    int nr = row + dr;
+                    int nc = col + dc;
+                    if(nr >= 0 && nr < grid_cells && nc >= 0 && nc < grid_cells) {
+                        int neighborIndex = nr * grid_cells + nc;
+                        if(d_full_curb[neighborIndex] == 1) {
+                            adjacentCurb = true;
+                        }
+                    }
+                }
+            }
+            if(adjacentCurb) {
+                d_full_sampling[i] = surroundingRetentionFraction;
+            }
+        }
+    }
+}
+
+// =======================================================================
 // Main GPU decimation function.
+// Note: A new parameter "surrounding_percent" is added so that cells adjacent to a curb cell
+// will retain only this fraction of points, while curb cells themselves retain CURB_PERCENT.
 extern "C" {
 EXPORT int adaptive_decimate_points_cuda(
     const double *all_points,   // input array (n_points*3 doubles)
@@ -450,7 +504,6 @@ EXPORT int adaptive_decimate_points_cuda(
     // ---------------------------------------------------------------------
     // (9) Prepare a device array for full sampling fractions, default 1.0.
     thrust::device_vector<double> d_full_sampling(num_cells);
-    // Use thrust::fill to set the default for all cells to 1.0.
     thrust::fill(d_full_sampling.begin(), d_full_sampling.end(), 1.0);
 
     // ---------------------------------------------------------------------
@@ -461,6 +514,26 @@ EXPORT int adaptive_decimate_points_cuda(
         thrust::raw_pointer_cast(d_sampling_fraction_unique.data()),
         unique_count, num_cells,
         thrust::raw_pointer_cast(d_full_sampling.data()));
+    cudaDeviceSynchronize();
+
+    // ---------------------------------------------------------------------
+    // NEW STEP: Also scatter the curb flags into a full-grid array, then update
+    // the sampling fraction for cells adjacent to any curb cell.
+    thrust::device_vector<int> d_full_curb(num_cells, 0);
+    numBlocks = (unique_count + blockSize - 1) / blockSize;
+    scatter_curb_kernel<<<numBlocks, blockSize>>>(
+        thrust::raw_pointer_cast(d_unique_cell_ids.data()),
+        thrust::raw_pointer_cast(d_curb.data()),
+        unique_count, num_cells,
+        thrust::raw_pointer_cast(d_full_curb.data()));
+    cudaDeviceSynchronize();
+
+    numBlocks = (num_cells + blockSize - 1) / blockSize;
+    preserve_adjacent_kernel<<<numBlocks, blockSize>>>(
+        grid_cells, num_cells,
+        thrust::raw_pointer_cast(d_full_curb.data()),
+        thrust::raw_pointer_cast(d_full_sampling.data()),
+        surrounding_percent);
     cudaDeviceSynchronize();
 
     // ---------------------------------------------------------------------
@@ -513,4 +586,3 @@ EXPORT int adaptive_decimate_points_cuda(
     return 0;
 }
 } // extern "C"
-
