@@ -1,31 +1,7 @@
-#!/usr/bin/env python3 
+#!/usr/bin/env python3
 """
-LAS to STL and optional STL to LandXML/PCD Converter with a dynamic UI
-
-This script:
-  - Converts a LAS file to an STL mesh.
-  - Optionally converts that STL mesh to a LandXML file containing a TIN surface.
-  - Optionally exports the (decimated) point cloud as a LAS file.
-  
-The UI includes:
-  - Fields for LAS → STL conversion.
-  - Checkboxes to enable/disable LandXML export, LAS export, and GPU decimation.
-
-Dependencies:
-  - laspy
-  - numpy
-  - scipy
-  - trimesh
-  - tqdm
-  - tkinter (built-in)
-  - numpy-stl
-  - dask[distributed]
-  
-Optional:
-  - pymeshlab (for advanced mesh cleaning)
-  
-Usage:
-  python combined_script.py
+LAS to STL and optional STL to LandXML/PCD Converter with a dynamic UI,
+plus integrated STL viewer (via Open3D)
 """
 
 import os
@@ -41,9 +17,9 @@ from scipy.spatial import Delaunay
 import trimesh
 from tqdm import tqdm
 from stl import mesh
-
-# Use dask for distributed parallelism (across nodes/cores)
 from dask.distributed import Client
+from tkinter import ttk  # Add this import at the top
+
 
 try:
     import pymeshlab
@@ -51,16 +27,73 @@ try:
 except ImportError:
     HAS_PYMESHLAB = False
 
+try:
+    import open3d as o3d
+except ImportError:
+    o3d = None
+
 ####################################
-# New LandXML template
+# Simple tooltip class for Tkinter widgets
+####################################
+class CreateToolTip(object):
+    """
+    Create a tooltip for a given widget.
+    """
+    def __init__(self, widget, text='widget info'):
+        self.widget = widget
+        self.text = text
+        self.tipwindow = None
+        self.id = None
+        widget.bind("<Enter>", self.enter)
+        widget.bind("<Leave>", self.leave)
+
+    def enter(self, event=None):
+        self.schedule()
+
+    def leave(self, event=None):
+        self.unschedule()
+        self.hidetip()
+
+    def schedule(self):
+        self.unschedule()
+        self.id = self.widget.after(500, self.showtip)
+
+    def unschedule(self):
+        id_ = self.id
+        self.id = None
+        if id_:
+            self.widget.after_cancel(id_)
+
+    def showtip(self, event=None):
+        if self.tipwindow:
+            return
+        # calculate position for the tooltip window
+        x, y, cx, cy = self.widget.bbox("insert")
+        x = x + self.widget.winfo_rootx() + 25
+        y = y + cy + self.widget.winfo_rooty() + 25
+        self.tipwindow = tw = tk.Toplevel(self.widget)
+        tw.wm_overrideredirect(True)
+        tw.wm_geometry("+%d+%d" % (x, y))
+        label = tk.Label(tw, text=self.text, justify=tk.LEFT,
+                         background="#ffffe0", relief=tk.SOLID, borderwidth=1,
+                         font=("tahoma", "8", "normal"), wraplength=300)
+        label.pack(ipadx=1)
+
+    def hidetip(self):
+        tw = self.tipwindow
+        self.tipwindow = None
+        if tw:
+            tw.destroy()
+
+####################################
+# Minimal LandXML template
 ####################################
 LANDXML_TEMPLATE = """<?xml version="1.0" encoding="UTF-8"?>
 <LandXML version="1.2" xmlns="http://www.landxml.org/schema/LandXML-1.2">
-  <Application name="{app_name}" desc="{app_desc}" manufacturer="{manufacturer}" version="{app_version}" manufacturerURL="{manufacturerURL}" />
+  <Application name="MyApp" desc="LandXML Export" manufacturer="MyCompany" version="1.0" manufacturerURL="http://www.example.com" />
   <Units>
-    {units_block}
+    <Metric linearUnit="meter" elevationUnit="meter" />
   </Units>
-  <CoordinateSystem name="{cs_full}" epsgCode="{epsg_code}" />
   <Surfaces>
     <Surface name="{surface_name}">
       <Definition surfType="TIN">
@@ -79,21 +112,12 @@ LANDXML_TEMPLATE = """<?xml version="1.0" encoding="UTF-8"?>
 ####################################
 # C adaptive decimation via ctypes
 ####################################
-# Determine the directory of this script.
 script_dir = os.path.dirname(os.path.abspath(__file__))
 
 ####################################
 # Parallel triangulation utilities using Dask
 ####################################
 def process_tile_dask(tile, all_points):
-    """
-    Process a tile dictionary containing:
-      - 'expanded': expanded bounding box (minx, miny, maxx, maxy)
-      - 'interior': interior bounding box (minx, miny, maxx, maxy)
-    Filters the provided all_points array to the expanded bbox,
-    performs Delaunay triangulation, and clips the resulting mesh to include only
-    faces touching the interior bbox.
-    """
     expanded_bbox = tile['expanded']
     interior_bbox = tile['interior']
     bx0, by0, bx1, by1 = expanded_bbox
@@ -139,8 +163,7 @@ def convert_las_to_stl(input_las, output_stl,
                        adaptive_maxfrac=1.0, curve_exponent=1.0,
                        flat_threshold=0.0, flat_fraction=0.0,
                        curb_threshold=0.2, use_gpu_decimation=False,
-                       output_xyz=None):  # output_xyz now will be treated as a LAS filename.
-    # Read the LAS file in chunks.
+                       output_xyz=None):
     with laspy.open(input_las) as las_file:
         total_points = las_file.header.point_count
         chunk_size = 500_000
@@ -153,7 +176,7 @@ def convert_las_to_stl(input_las, output_stl,
                 pbar.update(len(x))
         all_points = np.concatenate(points_list, axis=0)
 
-    # Optionally perform adaptive decimation.
+    # Optional adaptive decimation
     if adaptive_grid is not None and adaptive_grid > 1:
         print("Adaptive decimation settings:")
         print(f"  grid={adaptive_grid}")
@@ -165,7 +188,6 @@ def convert_las_to_stl(input_las, output_stl,
         n_points = all_points.shape[0]
         points_arr = np.ascontiguousarray(all_points, dtype=np.double)
 
-        # Select which shared library to load based on use_gpu_decimation.
         if use_gpu_decimation:
             if os.name == "nt":
                 dll_path = os.path.join(script_dir, "decimation_cuda.dll")
@@ -188,21 +210,20 @@ def convert_las_to_stl(input_las, output_stl,
             func = lib.adaptive_decimate_points
 
         func.argtypes = [
-            np.ctypeslib.ndpointer(dtype=np.double, flags="C_CONTIGUOUS"),  # input array (n_points*3)
-            ctypes.c_int,    # n_points
-            ctypes.c_int,    # grid_cells
-            ctypes.c_double, # min_fraction
-            ctypes.c_double, # max_fraction
-            ctypes.c_double, # curve_exponent
-            ctypes.c_double, # flat_threshold
-            ctypes.c_double, # flat_fraction
-            ctypes.c_double, # curb_edge_threshold
-            ctypes.POINTER(ctypes.POINTER(ctypes.c_double)),  # out_points (pointer-to-pointer)
-            ctypes.POINTER(ctypes.c_int)  # out_n_points
+            np.ctypeslib.ndpointer(dtype=np.double, flags="C_CONTIGUOUS"),
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_double,
+            ctypes.c_double,
+            ctypes.c_double,
+            ctypes.c_double,
+            ctypes.c_double,
+            ctypes.c_double,
+            ctypes.POINTER(ctypes.POINTER(ctypes.c_double)),
+            ctypes.POINTER(ctypes.c_int)
         ]
         func.restype = ctypes.c_int
 
-        # Prepare output variables.
         out_points = ctypes.POINTER(ctypes.c_double)()
         out_n_points = ctypes.c_int(0)
         ret = func(
@@ -221,29 +242,21 @@ def convert_las_to_stl(input_las, output_stl,
         if ret != 0:
             raise Exception("Adaptive decimation failed in C/CUDA code")
         kept_count = out_n_points.value
-        # Create a NumPy array from the C output.
         decimated_points = np.ctypeslib.as_array(out_points, shape=(kept_count, 3)).copy()
-        # Free the memory allocated in C.
         if os.name != "nt":
             libc = ctypes.CDLL("libc.so.6")
             libc.free.argtypes = [ctypes.c_void_p]
             libc.free(ctypes.cast(out_points, ctypes.c_void_p))
-        else:
-            # On Windows, skipping freeing to avoid CRT heap issues.
-            pass
         after_count = decimated_points.shape[0]
         print(f"Retained {after_count} / {before_count} points after adaptive decimation.")
         all_points = decimated_points
 
-    # Optional: Export the (decimated) point cloud as a LAS file.
+    # Optional: export the (decimated) point cloud as LAS
     if output_xyz is not None and output_xyz.strip():
-        # Create a new LAS header and file.
-        # Here we set the scale factors and offsets based on the min values.
         header = laspy.LasHeader(point_format=3, version="1.2")
         header.x_offset = np.min(all_points[:, 0])
         header.y_offset = np.min(all_points[:, 1])
         header.z_offset = np.min(all_points[:, 2])
-        # Set scale factors (adjust these if needed).
         header.x_scale = 0.001
         header.y_scale = 0.001
         header.z_scale = 0.001
@@ -255,11 +268,9 @@ def convert_las_to_stl(input_las, output_stl,
         las.write(output_xyz)
         print(f"Successfully exported decimated point cloud to LAS: {output_xyz}")
 
-    # Determine the bounding box.
+    # Tiling and triangulation
     min_x, min_y = np.min(all_points[:, :2], axis=0)
     max_x, max_y = np.max(all_points[:, :2], axis=0)
-
-    # Set up tiling parameters.
     tile_count_x = 4
     tile_count_y = 4
     overlap_ratio = 0.1
@@ -285,11 +296,9 @@ def convert_las_to_stl(input_las, output_stl,
             expanded_bbox = (tile_min_x_ov, tile_min_y_ov, tile_max_x_ov, tile_max_y_ov)
             tiles.append({'interior': interior_bbox, 'expanded': expanded_bbox})
 
-    # Set up a Dask client (which can span multiple nodes if configured appropriately).
     client = Client()
-    # Scatter all_points so that every worker has it.
     all_points_future = client.scatter(all_points, broadcast=True)
-    print("Triangulating each tile in parallel across the cluster...")
+    print("Triangulating each tile in parallel...")
     futures = [client.submit(process_tile_dask, t, all_points_future) for t in tiles]
     results = []
     for fut in tqdm(futures, desc="Tiling", unit="tile"):
@@ -307,30 +316,25 @@ def convert_las_to_stl(input_las, output_stl,
         return
 
     merged_mesh = trimesh.util.concatenate(sub_meshes)
-    print(" NOT Cleaning up duplicates and degenerates...")
-    #merged_mesh.merge_vertices()
-    #merged_mesh.remove_duplicate_faces()
-    #merged_mesh.remove_degenerate_faces()
-    print("Exporting final mesh to STL...")
     merged_mesh.export(output_stl, file_type='stl')
     print(f"Successfully exported {output_stl}")
 
 ####################################
-# STL -> LandXML converter (Optimized and Updated)
+# Minimal STL -> LandXML Converter
 ####################################
-def convert_stl_to_landxml(input_stl: str, output_xml: str,
-                           project_name: str, project_desc: str,
-                           app_name: str, manufacturer: str, app_version: str,
-                           cs_name: str, cs_datum: str, cs_zone: str,
-                           units_linear: str, units_area: str, units_volume: str) -> None:
+def convert_stl_to_landxml(input_stl: str, output_xml: str) -> None:
+    """
+    Hard-coded minimal LandXML export: no user-specified project/app info.
+    """
     print(f"Converting STL to LandXML: {input_stl} -> {output_xml}")
     stl_mesh = mesh.Mesh.from_file(input_stl)
     all_points = stl_mesh.vectors.reshape(-1, 3)
     points = np.round(all_points, 4)
     unique_points, inverse = np.unique(points, axis=0, return_inverse=True)
-    # Swap x and y columns so that LandXML receives them in the proper order.
-    unique_points = unique_points[:, [1, 0, 2]]
+    # If you need to swap X/Y for your workflow, uncomment:
+    # unique_points = unique_points[:, [1, 0, 2]]
     faces = inverse.reshape(-1, 3)
+
     points_block_lines = [
         f'    <P id="{i+1}"> {pt[0]} {pt[1]} {pt[2]} </P>' for i, pt in enumerate(unique_points)
     ]
@@ -339,46 +343,61 @@ def convert_stl_to_landxml(input_stl: str, output_xml: str,
         f'    <F> {face[0]+1} {face[1]+1} {face[2]+1} </F>' for face in faces
     ]
     faces_block = "\n".join(faces_block_lines)
-    app_desc = "LandXML Export"
-    manufacturerURL = "http://www.example.com"
-    # Simple handling for units:
-    if units_linear.lower() == "meter":
-        units_block = '<Metric linearUnit="meter" elevationUnit="meter" />'
-    elif units_linear.lower() in ["international foot", "us survey foot"]:
-        units_block = '<Imperial linearUnit="foot" elevationUnit="feet" />'
-    else:
-        units_block = '<Imperial linearUnit="foot" elevationUnit="feet" />'
-    # Construct coordinate system string.
-    if cs_name == "StatePlane":
-        unit_desc = units_linear.lower()
-        cs_full = f"State Plane ({cs_zone}) / {cs_datum} / {unit_desc}"
-        # Example EPSG code logic.
-        if cs_zone == "Arizona Central" and cs_datum in ["NAD83(2011)", "NAD83"]:
-            epsg_code = "6405" if cs_datum == "NAD83(2011)" else "2223"
-        else:
-            epsg_code = "0000"
-    else:
-        cs_full = cs_name
-        epsg_code = "0000"
+
     surface_name = os.path.basename(output_xml)
     xml_content = LANDXML_TEMPLATE.format(
-        app_name=app_name,
-        app_desc=app_desc,
-        manufacturer=manufacturer,
-        app_version=app_version,
-        manufacturerURL=manufacturerURL,
-        units_block=units_block,
-        cs_full=cs_full,
-        epsg_code=epsg_code,
         surface_name=surface_name,
         points_block=points_block,
-        faces_block=faces_block,
-        project_name=project_name,
-        project_desc=project_desc
+        faces_block=faces_block
     )
     with open(output_xml, 'w') as f:
         f.write(xml_content)
     print(f"LandXML written to: {output_xml}")
+
+####################################
+# STL Viewer using Open3D (integrated from stl_viewer.py)
+####################################
+
+def view_stl(stl_file: str):
+    if o3d is None:
+        messagebox.showerror("Open3D Error", "Open3D is not installed. Cannot view STL.")
+        return
+
+    # Create a larger loading window
+    loading_win = tk.Toplevel()
+    loading_win.title("Loading Mesh")
+    loading_win.geometry("400x200")  # Increase the window size
+    label = tk.Label(loading_win, text="Loading mesh, please wait...", font=("Helvetica", 14))
+    label.pack(padx=20, pady=20)
+    progress_bar = ttk.Progressbar(loading_win, mode="indeterminate", length=300)
+    progress_bar.pack(padx=20, pady=20)
+    progress_bar.start(10)  # Animation speed
+    loading_win.update()
+
+    # Load the mesh (this may take some time)
+    mesh_o3d = o3d.io.read_triangle_mesh(stl_file)
+    
+    # Once loaded, stop and close the loading window
+    progress_bar.stop()
+    loading_win.destroy()
+
+    if mesh_o3d.is_empty():
+        messagebox.showerror("Error", "Mesh is empty or failed to load.")
+        return
+
+    # Compute normals and center the mesh
+    mesh_o3d.compute_vertex_normals()
+    center = mesh_o3d.get_center()
+    mesh_o3d.translate(-center)
+    
+    # Create an Open3D visualizer window and adjust rendering options
+    vis = o3d.visualization.Visualizer()
+    vis.create_window(window_name="Fast STL Viewer", width=1280, height=720)
+    opt = vis.get_render_option()
+    opt.mesh_show_wireframe = False  # Disable wireframe lines so the mesh appears smooth
+    vis.add_geometry(mesh_o3d)
+    vis.run()
+    vis.destroy_window()
 
 ####################################
 # UI Implementation
@@ -386,44 +405,36 @@ def convert_stl_to_landxml(input_stl: str, output_xml: str,
 def run_conversion():
     input_las = entry_input.get()
     output_stl = entry_output.get()
-    try:
-        adaptive_grid = int(entry_adaptive_grid.get()) if entry_adaptive_grid.get() else None
-    except ValueError:
-        messagebox.showerror("Error", "Adaptive Grid must be an integer.")
-        return
-    try:
-        adaptive_minfrac = float(entry_adaptive_minfrac.get()) if entry_adaptive_minfrac.get() else 0.1
-    except ValueError:
-        messagebox.showerror("Error", "Min Fraction must be float.")
-        return
-    try:
-        adaptive_maxfrac = float(entry_adaptive_maxfrac.get()) if entry_adaptive_maxfrac.get() else 1.0
-    except ValueError:
-        messagebox.showerror("Error", "Max Fraction must be float.")
-        return
-    try:
-        curve_exponent = float(entry_curve_exponent.get()) if entry_curve_exponent.get() else 1.0
-    except ValueError:
-        messagebox.showerror("Error", "Curve Exponent must be float.")
-        return
-    try:
-        flat_threshold = float(entry_flat_threshold.get()) if entry_flat_threshold.get() else 0.0
-    except ValueError:
-        messagebox.showerror("Error", "Flat Threshold must be float.")
-        return
-    try:
-        flat_fraction = float(entry_flat_fraction.get()) if entry_flat_fraction.get() else 0.0
-    except ValueError:
-        messagebox.showerror("Error", "Flat Fraction must be float.")
-        return
-    try:
-        curb_threshold = float(entry_curb_threshold.get()) if entry_curb_threshold.get() else 0.2
-    except ValueError:
-        messagebox.showerror("Error", "Curb Edge Threshold must be float.")
-        return
+
+    # Parse or fall back to defaults if empty:
+    def floatval_or_default(entry_widget, default):
+        val_str = entry_widget.get().strip()
+        if not val_str:
+            return default
+        try:
+            return float(val_str)
+        except ValueError:
+            return default
+
+    def intval_or_default(entry_widget, default):
+        val_str = entry_widget.get().strip()
+        if not val_str:
+            return default
+        try:
+            return int(val_str)
+        except ValueError:
+            return default
+
+    # Gather decimation parameters, using defaults if the field is empty or invalid
+    adaptive_grid = intval_or_default(entry_adaptive_grid, 1000)
+    adaptive_minfrac = floatval_or_default(entry_adaptive_minfrac, 0.0005)
+    adaptive_maxfrac = floatval_or_default(entry_adaptive_maxfrac, 0.1)
+    curve_exponent = floatval_or_default(entry_curve_exponent, 0.4)
+    flat_threshold = floatval_or_default(entry_flat_threshold, 0.008)
+    flat_fraction = floatval_or_default(entry_flat_fraction, 0.0)
+    curb_threshold = floatval_or_default(entry_curb_threshold, 0.065)
 
     use_gpu = use_gpu_decimation_var.get()
-    # Get optional LAS export filename (if specified)
     export_xyz_path = entry_xyz_output.get() if export_xyz_var.get() else None
 
     try:
@@ -443,43 +454,23 @@ def run_conversion():
         messagebox.showerror("Error", f"LAS -> STL failed: {e}")
         return
 
+    # Minimal LandXML export if selected
     if export_landxml_var.get():
         output_landxml = entry_landxml_output.get()
         if not output_landxml:
             messagebox.showerror("Error", "Please specify an output LandXML file.")
             return
-        project_name = entry_lxml_project_name.get()
-        project_desc = entry_lxml_project_desc.get()
-        app_name = entry_lxml_app_name.get()
-        manufacturer = entry_lxml_manufacturer.get()
-        app_version = entry_lxml_app_version.get()
-        cs_name = var_cs_name.get()
-        cs_datum = var_cs_datum.get()
-        cs_zone = var_cs_zone.get()
-        units_linear = var_units_linear.get()
-        units_area = var_units_area.get()
-        units_volume = var_units_volume.get()
         try:
-            convert_stl_to_landxml(
-                input_stl=output_stl,
-                output_xml=entry_landxml_output.get(),
-                project_name=project_name,
-                project_desc=project_desc,
-                app_name=app_name,
-                manufacturer=manufacturer,
-                app_version=app_version,
-                cs_name=cs_name,
-                cs_datum=cs_datum,
-                cs_zone=cs_zone,
-                units_linear=units_linear,
-                units_area=units_area,
-                units_volume=units_volume
-            )
-            messagebox.showinfo("Success", f"Exported STL + LandXML:\n{output_stl}\n{entry_landxml_output.get()}")
+            convert_stl_to_landxml(output_stl, output_landxml)
+            messagebox.showinfo("Success", f"Exported STL + LandXML:\n{output_stl}\n{output_landxml}")
         except Exception as e:
             messagebox.showerror("Error", f"STL -> LandXML failed: {e}")
     else:
         messagebox.showinfo("Success", f"Exported STL: {output_stl}")
+
+    # Prompt user to view the STL using the integrated viewer
+    if messagebox.askyesno("View STL", "Do you want to view the generated STL file?"):
+        view_stl(output_stl)
 
 def toggle_landxml_frame():
     if export_landxml_var.get():
@@ -512,32 +503,29 @@ def browse_landxml_file():
         entry_landxml_output.insert(0, filename)
 
 def browse_xyz_file():
-    # Updated to default to .las instead of .pcd.
     filename = filedialog.asksaveasfilename(defaultextension=".las", filetypes=[("LAS Files", "*.las")])
     if filename:
         entry_xyz_output.delete(0, tk.END)
         entry_xyz_output.insert(0, filename)
 
 ####################################
-# Start of main UI
+# Main UI
 ####################################
 def main():
     global entry_input, entry_output
     global entry_adaptive_grid, entry_adaptive_minfrac, entry_adaptive_maxfrac
     global entry_curve_exponent, entry_flat_threshold, entry_flat_fraction, entry_curb_threshold
-    global export_landxml_var, landxml_frame, entry_landxml_output, landxml_row
-    global entry_lxml_project_name, entry_lxml_project_desc
-    global entry_lxml_app_name, entry_lxml_manufacturer, entry_lxml_app_version
-    global var_cs_name, var_cs_datum, var_cs_zone
-    global var_units_linear, var_units_area, var_units_volume
     global use_gpu_decimation_var, export_xyz_var, xyz_frame, entry_xyz_output, xyz_row
+    global export_landxml_var, landxml_frame, entry_landxml_output, landxml_row
 
     root = tk.Tk()
     root.title("LAS -> STL -> (optional) LandXML / LAS Converter")
     main_frame = tk.Frame(root, padx=10, pady=10)
     main_frame.pack(fill=tk.BOTH, expand=True)
+
     row_idx = 0
 
+    # LAS input / STL output
     tk.Label(main_frame, text="Input LAS File:").grid(row=row_idx, column=0, sticky=tk.W)
     entry_input = tk.Entry(main_frame, width=50)
     entry_input.grid(row=row_idx, column=1)
@@ -550,132 +538,121 @@ def main():
     tk.Button(main_frame, text="Browse", command=browse_output_file).grid(row=row_idx, column=2)
     row_idx += 1
 
-    tk.Label(main_frame, text="Adaptive Decimation Grid (opt):").grid(row=row_idx, column=0, sticky=tk.W)
+    # Decimation parameters (with tooltips)
+    adaptive_label = tk.Label(main_frame, text="Adaptive Decimation Grid (opt):")
+    adaptive_label.grid(row=row_idx, column=0, sticky=tk.W)
+    CreateToolTip(adaptive_label, "AAdaptive Decimation Grid (set to 1000 for starting point): This is the resolution at which the decimation occurs. The script will split the entire model up into a grid in this resolution. In this case 1000x1000. This is used to detect where the curbs are and keeps the density in the cells that curbs are detected. Additionally, it keeps the nearby cells dense as a buffer. The larger it is the more fine the resolution, but also the risk of blowing out the triangles.")
     entry_adaptive_grid = tk.Entry(main_frame, width=50)
+    entry_adaptive_grid.insert(0, "1000")
     entry_adaptive_grid.grid(row=row_idx, column=1)
     row_idx += 1
 
-    tk.Label(main_frame, text="Min Fraction (opt):").grid(row=row_idx, column=0, sticky=tk.W)
+    minfrac_label = tk.Label(main_frame, text="Min Fraction (opt):")
+    minfrac_label.grid(row=row_idx, column=0, sticky=tk.W)
+    CreateToolTip(minfrac_label, "Min Fraction (set to 0.0005 for starting point): This is the amount of triangles that will remain in a grid cell at the most flat area. This does not include the areas that are considered perfectly flat, which is governed by the flat fraction instead.")
     entry_adaptive_minfrac = tk.Entry(main_frame, width=50)
+    entry_adaptive_minfrac.insert(0, "0.0005")
     entry_adaptive_minfrac.grid(row=row_idx, column=1)
     row_idx += 1
 
-    tk.Label(main_frame, text="Max Fraction (opt):").grid(row=row_idx, column=0, sticky=tk.W)
+    maxfrac_label = tk.Label(main_frame, text="Max Fraction (opt):")
+    maxfrac_label.grid(row=row_idx, column=0, sticky=tk.W)
+    CreateToolTip(maxfrac_label, "Max Fraction (set to 0.1 for starting point): This is the amount of triangles that will remain in a grid cell at the least flat area. This does not include the curb cells, which is hard-coded to keep 100 percent of the points.")
     entry_adaptive_maxfrac = tk.Entry(main_frame, width=50)
+    entry_adaptive_maxfrac.insert(0, "0.1")
     entry_adaptive_maxfrac.grid(row=row_idx, column=1)
     row_idx += 1
 
-    tk.Label(main_frame, text="Curve Exponent (opt):").grid(row=row_idx, column=0, sticky=tk.W)
+    curve_label = tk.Label(main_frame, text="Curve Exponent (opt):")
+    curve_label.grid(row=row_idx, column=0, sticky=tk.W)
+    CreateToolTip(curve_label, "Curve Exponent (set to 0.4 for starting point): This is the mathematical curve between the min and max fractions. Basically just sets how much the decimation ramps up to the max fraction. Higher values favor the min fraction and produces less triangles.")
     entry_curve_exponent = tk.Entry(main_frame, width=50)
+    entry_curve_exponent.insert(0, "0.4")
     entry_curve_exponent.grid(row=row_idx, column=1)
     row_idx += 1
 
-    tk.Label(main_frame, text="Flat Threshold (opt):").grid(row=row_idx, column=0, sticky=tk.W)
+    flat_thresh_label = tk.Label(main_frame, text="Flat Threshold (opt):")
+    flat_thresh_label.grid(row=row_idx, column=0, sticky=tk.W)
+    CreateToolTip(flat_thresh_label, "Flat Threshold (set to 0.008 for starting point): This effects the amount of ground that will be considered completely flat. The higher the value the more areas that will be considered completely flat.")
     entry_flat_threshold = tk.Entry(main_frame, width=50)
+    entry_flat_threshold.insert(0, "0.008")
     entry_flat_threshold.grid(row=row_idx, column=1)
     row_idx += 1
 
-    tk.Label(main_frame, text="Flat Fraction (opt):").grid(row=row_idx, column=0, sticky=tk.W)
+    flat_frac_label = tk.Label(main_frame, text="Flat Fraction (opt):")
+    flat_frac_label.grid(row=row_idx, column=0, sticky=tk.W)
+    CreateToolTip(flat_frac_label, "Flat Fraction (set to 0 for starting point): This is the minimum amount of triangles that must remain in a cell when it is considered completely flat. Set only to very low values such as 0 or 0.000001.")
     entry_flat_fraction = tk.Entry(main_frame, width=50)
+    entry_flat_fraction.insert(0, "0")
     entry_flat_fraction.grid(row=row_idx, column=1)
     row_idx += 1
 
-    tk.Label(main_frame, text="Curb Edge Threshold (m, opt):").grid(row=row_idx, column=0, sticky=tk.W)
+    curb_label = tk.Label(main_frame, text="Curb Edge Threshold (m, opt):")
+    curb_label.grid(row=row_idx, column=0, sticky=tk.W)
+    CreateToolTip(curb_label, "Curb Edge Threshold (set to 0.065 for starting point): This is the distance that will calculate whether or not an area is a curb. The higher the values the higher an cliff needs to be to be considered a curb.")
     entry_curb_threshold = tk.Entry(main_frame, width=50)
+    entry_curb_threshold.insert(0, "0.065")
     entry_curb_threshold.grid(row=row_idx, column=1)
     row_idx += 1
 
-    # Add a checkbox to select GPU decimation.
+    # GPU decimation checkbox
     use_gpu_decimation_var = tk.BooleanVar(value=False)
-    tk.Checkbutton(main_frame, text="Use GPU for Decimation?", variable=use_gpu_decimation_var).grid(
-        row=row_idx, column=0, columnspan=3, sticky=tk.W, pady=(10, 0)
-    )
+    tk.Checkbutton(
+        main_frame,
+        text="Use GPU for Decimation?",
+        variable=use_gpu_decimation_var
+    ).grid(row=row_idx, column=0, columnspan=3, sticky=tk.W, pady=(10, 0))
     row_idx += 1
 
-    # Checkbox for Export LAS and its file selection.
+    # Optional export LAS
     export_xyz_var = tk.BooleanVar(value=False)
-    tk.Checkbutton(main_frame, text="Export LAS Point Cloud?", variable=export_xyz_var, command=toggle_xyz_frame).grid(
-        row=row_idx, column=0, columnspan=3, sticky=tk.W, pady=(10, 0)
-    )
+    tk.Checkbutton(
+        main_frame,
+        text="Export LAS Point Cloud?",
+        variable=export_xyz_var,
+        command=toggle_xyz_frame
+    ).grid(row=row_idx, column=0, columnspan=3, sticky=tk.W, pady=(10, 0))
     row_idx += 1
     xyz_row = row_idx
+    row_idx += 1
+
     xyz_frame = tk.Frame(main_frame, borderwidth=1, relief=tk.RIDGE, padx=5, pady=5)
     tk.Label(xyz_frame, text="Output LAS File:").grid(row=0, column=0, sticky=tk.W)
     entry_xyz_output = tk.Entry(xyz_frame, width=50)
     entry_xyz_output.grid(row=0, column=1)
     tk.Button(xyz_frame, text="Browse", command=browse_xyz_file).grid(row=0, column=2)
     xyz_frame.grid(row=xyz_row, column=0, columnspan=3, sticky="nsew", pady=(10, 0))
-    xyz_frame.grid_remove()  # hide by default
+    xyz_frame.grid_remove()
 
+    # Optional export LandXML (minimal)
     export_landxml_var = tk.BooleanVar(value=False)
-    tk.Checkbutton(main_frame, text="Export LandXML?", variable=export_landxml_var, command=toggle_landxml_frame).grid(
-        row=row_idx, column=0, columnspan=3, sticky=tk.W, pady=(10, 0)
-    )
+    tk.Checkbutton(
+        main_frame,
+        text="Export LandXML?",
+        variable=export_landxml_var,
+        command=toggle_landxml_frame
+    ).grid(row=row_idx, column=0, columnspan=3, sticky=tk.W, pady=(10, 0))
+    row_idx += 1
+    landxml_row = row_idx
     row_idx += 1
 
-    landxml_row = row_idx
     landxml_frame = tk.Frame(main_frame, borderwidth=1, relief=tk.RIDGE, padx=5, pady=5)
     tk.Label(landxml_frame, text="Output LandXML File:").grid(row=0, column=0, sticky=tk.W)
     entry_landxml_output = tk.Entry(landxml_frame, width=50)
     entry_landxml_output.grid(row=0, column=1)
     tk.Button(landxml_frame, text="Browse", command=browse_landxml_file).grid(row=0, column=2)
-    tk.Label(landxml_frame, text="Project Name:").grid(row=1, column=0, sticky=tk.W)
-    entry_lxml_project_name = tk.Entry(landxml_frame, width=50)
-    entry_lxml_project_name.grid(row=1, column=1)
-    tk.Label(landxml_frame, text="Project Description:").grid(row=2, column=0, sticky=tk.W)
-    entry_lxml_project_desc = tk.Entry(landxml_frame, width=50)
-    entry_lxml_project_desc.grid(row=2, column=1)
-    tk.Label(landxml_frame, text="Application Name:").grid(row=3, column=0, sticky=tk.W)
-    entry_lxml_app_name = tk.Entry(landxml_frame, width=50)
-    entry_lxml_app_name.grid(row=3, column=1)
-    tk.Label(landxml_frame, text="Manufacturer:").grid(row=4, column=0, sticky=tk.W)
-    entry_lxml_manufacturer = tk.Entry(landxml_frame, width=50)
-    entry_lxml_manufacturer.grid(row=4, column=1)
-    tk.Label(landxml_frame, text="Application Version:").grid(row=5, column=0, sticky=tk.W)
-    entry_lxml_app_version = tk.Entry(landxml_frame, width=50)
-    entry_lxml_app_version.grid(row=5, column=1)
-    cs_options = ["StatePlane", "UTM", "WGS84", "Custom"]
-    datum_options = ["NAD83(2011)", "NAD83", "NAD27", "WGS84", "ETRS89"]
-    zone_options = ["Arizona Central", "0000", "0601", "Custom"]
-    tk.Label(landxml_frame, text="Coord System Name:").grid(row=6, column=0, sticky=tk.W)
-    var_cs_name = tk.StringVar(value=cs_options[0])
-    cs_menu = tk.OptionMenu(landxml_frame, var_cs_name, *cs_options)
-    cs_menu.config(width=30)
-    cs_menu.grid(row=6, column=1, sticky=tk.W)
-    tk.Label(landxml_frame, text="Coord System Datum:").grid(row=7, column=0, sticky=tk.W)
-    var_cs_datum = tk.StringVar(value=datum_options[0])
-    datum_menu = tk.OptionMenu(landxml_frame, var_cs_datum, *datum_options)
-    datum_menu.config(width=30)
-    datum_menu.grid(row=7, column=1, sticky=tk.W)
-    tk.Label(landxml_frame, text="Coord System Zone:").grid(row=8, column=0, sticky=tk.W)
-    var_cs_zone = tk.StringVar(value=zone_options[0])
-    zone_menu = tk.OptionMenu(landxml_frame, var_cs_zone, *zone_options)
-    zone_menu.config(width=30)
-    zone_menu.grid(row=8, column=1, sticky=tk.W)
-    linear_units = ["meter", "International Foot", "US Survey Foot"]
-    area_units = ["squareMeter", "Square Foot (International)", "Square Foot (US Survey)"]
-    volume_units = ["cubicMeter", "Cubic Foot (International)", "Cubic Foot (US Survey)"]
-    tk.Label(landxml_frame, text="Linear Unit:").grid(row=9, column=0, sticky=tk.W)
-    var_units_linear = tk.StringVar(value=linear_units[0])
-    linear_menu = tk.OptionMenu(landxml_frame, var_units_linear, *linear_units)
-    linear_menu.config(width=30)
-    linear_menu.grid(row=9, column=1, sticky=tk.W)
-    tk.Label(landxml_frame, text="Area Unit:").grid(row=10, column=0, sticky=tk.W)
-    var_units_area = tk.StringVar(value=area_units[0])
-    area_menu = tk.OptionMenu(landxml_frame, var_units_area, *area_units)
-    area_menu.config(width=30)
-    area_menu.grid(row=10, column=1, sticky=tk.W)
-    tk.Label(landxml_frame, text="Volume Unit:").grid(row=11, column=0, sticky=tk.W)
-    var_units_volume = tk.StringVar(value=volume_units[0])
-    volume_menu = tk.OptionMenu(landxml_frame, var_units_volume, *volume_units)
-    volume_menu.config(width=30)
-    volume_menu.grid(row=11, column=1, sticky=tk.W)
     landxml_frame.grid(row=landxml_row, column=0, columnspan=3, sticky="nsew", pady=(10, 0))
     landxml_frame.grid_remove()
-    row_idx = landxml_row + 1
 
-    tk.Button(main_frame, text="Convert", command=run_conversion).grid(row=row_idx, column=0, columnspan=3, pady=(10, 0))
+    # Convert button
+    tk.Button(
+        main_frame,
+        text="Convert",
+        command=run_conversion
+    ).grid(row=row_idx, column=0, columnspan=3, pady=(10, 0))
+
     root.mainloop()
 
 if __name__ == "__main__":
     main()
+

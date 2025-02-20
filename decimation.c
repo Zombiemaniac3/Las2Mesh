@@ -14,9 +14,10 @@
 #define MIN_POINTS_FOR_CURB 12      // Minimum points in a (sub)cell to perform curb detection
 #define MIN_UPPER_POINTS 8          // Minimum points in the upper group to flag a curb
 #define SUBDIV_FACTOR 4             // Subdivide each main cell into SUBDIV_FACTOR x SUBDIV_FACTOR sub-cells
-#define CURB_PERCENT 0.2	        // The percent of points that will remain in a cell that was considered a curb
+#define CURB_PERCENT 1.0            // The percent of points that will remain in a cell that was considered a curb
+#define SURROUNDING_PERCENT 1.0     // Added: The percent of points to keep in cells adjacent to curb cells
 
-// qsort comparison function for doubles.
+// qsort comparison function for doubles
 static int compare_doubles(const void* a, const void* b) {
     double da = *(const double*)a;
     double db = *(const double*)b;
@@ -73,6 +74,31 @@ static int solve_3x3(double M[3][3], double b[3], double x[3]) {
     return 0;
 }
 
+// NEW: Helper function to update surrounding cells' sampling fractions
+static void update_surrounding_cells(int cell_id, int grid_cells, double* cell_fraction) {
+    int row = cell_id / grid_cells;
+    int col = cell_id % grid_cells;
+    
+    // Check all 8 surrounding cells
+    for (int dr = -1; dr <= 1; dr++) {
+        for (int dc = -1; dc <= 1; dc++) {
+            if (dr == 0 && dc == 0) continue;  // Skip the center cell
+            
+            int nr = row + dr;
+            int nc = col + dc;
+            
+            // Check if the neighboring cell is within grid bounds
+            if (nr >= 0 && nr < grid_cells && nc >= 0 && nc < grid_cells) {
+                int neighbor_id = nr * grid_cells + nc;
+                // Only update if the current fraction is lower than SURROUNDING_PERCENT
+                if (cell_fraction[neighbor_id] < SURROUNDING_PERCENT) {
+                    cell_fraction[neighbor_id] = SURROUNDING_PERCENT;
+                }
+            }
+        }
+    }
+}
+
 ///
 /// adaptive_decimate_points
 ///
@@ -89,7 +115,7 @@ static int solve_3x3(double M[3][3], double b[3], double x[3]) {
 ///
 /// Returns 0 on success or -1 on error.
 EXPORT int adaptive_decimate_points(
-    const double* all_points, // input array (n_points*3)
+    const double* all_points,
     int n_points,
     int grid_cells,
     double min_fraction,
@@ -97,9 +123,9 @@ EXPORT int adaptive_decimate_points(
     double curve_exponent,
     double flat_threshold,
     double flat_fraction,
-    double curb_edge_threshold,  // threshold (in meters) for detecting a curb in a sub-cell
-    double** out_points,      // output: newly allocated array of decimated points (size out_n_points*3)
-    int* out_n_points         // output: number of decimated points
+    double curb_edge_threshold,
+    double** out_points,
+    int* out_n_points
 ) {
     if(n_points <= 0) return -1;
     
@@ -305,7 +331,7 @@ EXPORT int adaptive_decimate_points(
         is_curb[c] = curb_flag;
     }
     
-    // Compute a sampling fraction for each cell.
+    // For each cell, compute a sampling fraction.
     double* cell_fraction = (double*)malloc(num_cells * sizeof(double));
     if(!cell_fraction) {
         free(is_curb); free(cell_std); free(current_index);
@@ -313,15 +339,14 @@ EXPORT int adaptive_decimate_points(
         free(cell_indices); free(cell_ids); free(cell_counts);
         return -1;
     }
+
+    // First pass: Set initial sampling fractions
     for (int c = 0; c < num_cells; c++) {
         double frac;
-        if(is_curb[c]) {
-            // If flagged as curb, keep 100% of points.
-            frac = CURB_PERCENT;
-        } else if(cell_std[c] < flat_threshold) {
+        if(cell_std[c] < flat_threshold) {
             frac = flat_fraction;
         } else {
-            // Otherwise, map the standard deviation (normalized over all cells) to a fraction.
+            // Map the standard deviation (normalized over all cells) to a fraction
             double global_min_std = cell_std[0], global_max_std = cell_std[0];
             for (int cc = 0; cc < num_cells; cc++) {
                 if(cell_std[cc] < global_min_std) global_min_std = cell_std[cc];
@@ -337,6 +362,15 @@ EXPORT int adaptive_decimate_points(
             if(frac > max_fraction) frac = max_fraction;
         }
         cell_fraction[c] = frac;
+    }
+
+    // Second pass: Update fractions for curb cells and their surroundings
+    for (int c = 0; c < num_cells; c++) {
+        if(is_curb[c]) {
+            cell_fraction[c] = CURB_PERCENT;
+            // Update surrounding cells to use SURROUNDING_PERCENT
+            update_surrounding_cells(c, grid_cells, cell_fraction);
+        }
     }
     
     // For each point, decide whether to keep it based on its cell's sampling fraction.
