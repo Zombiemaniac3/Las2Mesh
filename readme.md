@@ -1,6 +1,6 @@
 # LAS to STL Converter
 
-A high-performance Python tool for converting LiDAR point cloud data (LAS/LAZ) to 3D mesh models (STL) with intelligent adaptive decimation and curb detection.
+A high-performance Python tool for converting LiDAR point cloud data (LAS) to 3D mesh models (STL) with intelligent adaptive decimation and curb detection.
 
 ## Features
 
