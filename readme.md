@@ -4,13 +4,13 @@ A high-performance Python tool for converting LiDAR point cloud data (LAS/LAZ) t
 
 ## Features
 
-- Convert LAS/LAZ files to STL mesh models
+- Convert LAS files to STL mesh models
 - GPU-accelerated adaptive decimation (CUDA support)
-- Intelligent curb detection and preservation
+- Curb detection and preservation
 - Optional LandXML export
 - Built-in STL viewer using Open3D
 - Multi-threaded processing using Dask
-- User-friendly GUI interface
+- GUI interface
 
 ## Requirements
 
