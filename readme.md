@@ -91,7 +91,7 @@ python stl_viewer.py your_model.stl
 ## Features in Detail
 
 ### Adaptive Decimation
-The tool uses an intelligent adaptive decimation algorithm that:
+The tool uses an adaptive decimation algorithm that:
 - Preserves detail in areas of high complexity
 - Reduces point density in flat regions
 - Maintains curb features with high fidelity
@@ -104,10 +104,10 @@ Employs a sophisticated algorithm to:
 - Maintain higher point density in adjacent areas
 
 ### Multi-format Support
-- Input: LAS/LAZ point cloud files
+- Input: LAS point cloud files
 - Output: STL mesh files
 - Optional: LandXML export for CAD compatibility
-- Optional: Decimated point cloud export
+- Optional: Decimated point cloud export as LAS
 
 ## Performance
 
@@ -123,4 +123,4 @@ Built with:
 - Open3D for visualization
 - CUDA for GPU acceleration
 - Dask for distributed computing
-- laspy for LAS/LAZ handling
+- laspy for LAS handling
